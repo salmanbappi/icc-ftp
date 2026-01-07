@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.SharedPreferences
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -20,6 +21,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import uy.kohesive.injekt.Injekt
@@ -40,18 +42,13 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         val originalRequest = chain.request()
         val originalUrl = originalRequest.url
 
-        // Skip recursion
         if (originalUrl.encodedPath == "/" && originalUrl.querySize == 0) {
             return@Interceptor chain.proceed(originalRequest)
         }
 
-        val newUrl = if (originalUrl.queryParameter("session") == null) {
-            if (sessionId.isBlank()) {
-                fetchSessionId()
-            }
-            originalUrl.newBuilder()
-                .addQueryParameter("session", sessionId)
-                .build()
+        val newUrl = if (originalUrl.queryParameter("session") == null && !originalUrl.encodedPath.contains("command.php")) {
+            if (sessionId.isBlank()) fetchSessionId()
+            originalUrl.newBuilder().addQueryParameter("session", sessionId).build()
         } else {
             originalUrl
         }
@@ -59,10 +56,9 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         val request = originalRequest.newBuilder().url(newUrl).build()
         val response = chain.proceed(request)
 
-        // If redirected to login or dashboard without session, invalidate and retry
         if (response.request.url.encodedPath.contains("vfw.php") || (response.code == 302 && response.header("Location")?.contains("vfw.php") == true)) {
             response.close()
-            sessionId = "" // Invalidate
+            sessionId = "" 
             fetchSessionId()
             val retryUrl = originalUrl.newBuilder().addQueryParameter("session", sessionId).build()
             return@Interceptor chain.proceed(originalRequest.newBuilder().url(retryUrl).build())
@@ -80,100 +76,108 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     @Synchronized
     private fun fetchSessionId() {
         if (sessionId.isNotBlank()) return
-
         try {
-            // This request will trigger the redirect chain
-            // http://10.16.100.244/ -> ncisvfwall -> dashboard.php?session=...
-            val initialReq = GET(baseUrl)
-            val response = client.newCall(initialReq).execute()
+            val response = client.newCall(GET(baseUrl)).execute()
             val finalUrl = response.request.url
             response.close()
-
             val session = finalUrl.queryParameter("session")
-            if (session != null) {
-                sessionId = session
-            } else {
-                throw IOException("Failed to extract session ID from ${finalUrl}")
-            }
+            if (session != null) sessionId = session
         } catch (e: Exception) {
-            throw IOException("Failed to obtain session ID: ${e.message}")
+            // Log error
         }
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
-        val response = client.newCall(GET("$baseUrl/dashboard.php")).execute()
-        val document = response.asJsoup()
-        return parseAnimeList(document)
+        val request = if (page == 1) {
+            GET("$baseUrl/dashboard.php")
+        } else {
+            val body = FormBody.Builder().add("cpage", page.toString()).build()
+            POST("$baseUrl/command.php", body = body)
+        }
+        val response = client.newCall(request).execute()
+        return parseAnimeList(response.asJsoup(), page < 50) // Guessing max pages
     }
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage = getPopularAnime(page)
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        // We need the token from the dashboard first
-        val dashboard = client.newCall(GET("$baseUrl/dashboard.php")).execute().asJsoup()
-        val token = dashboard.selectFirst("input[name=token]")?.attr("value") 
-            ?: throw IOException("CSRF Token not found")
+        if (query.isNotBlank()) {
+            val dashboard = client.newCall(GET("$baseUrl/dashboard.php")).execute().asJsoup()
+            val token = dashboard.selectFirst("input[name=token]")?.attr("value") ?: ""
+            val body = FormBody.Builder().add("token", token).add("psearch", query).build()
+            val response = client.newCall(POST("$baseUrl/dashboard.php", body = body)).execute()
+            return parseAnimeList(response.asJsoup(), false)
+        }
 
-        val body = FormBody.Builder()
-            .add("token", token)
-            .add("psearch", query)
-            .build()
+        var category = ""
+        filters.forEach { filter ->
+            if (filter is CategoryFilter) category = filter.toValue()
+        }
 
-        val response = client.newCall(POST("$baseUrl/dashboard.php", body = body)).execute()
-        return parseAnimeList(response.asJsoup())
+        val url = if (category.isNotBlank()) "$baseUrl/dashboard.php?category=$category" else "$baseUrl/dashboard.php"
+        val response = client.newCall(GET(url)).execute()
+        return parseAnimeList(response.asJsoup(), false)
     }
 
-    private fun parseAnimeList(document: Document): AnimesPage {
-        val items = document.select("div.item, div.post-item") // Trying to match potential grid items
+    private fun parseAnimeList(document: Document, hasNext: Boolean): AnimesPage {
+        val items = document.select("div.item, div.post, div.post-item") 
         val animeList = items.mapNotNull { item ->
-            val link = item.parent() // The <a> tag wraps the div.item in the dump
-            val url = link.attr("href")
-            val img = item.selectFirst("div.img")?.attr("style")
-                ?.substringAfter("url('")?.substringBefore("')")
-            val title = item.selectFirst("div.title span")?.text()
-
-            if (url.isNotEmpty() && title != null) {
-                SAnime.create().apply {
-                    this.url = url // Contains player.php?session=...&play=ID
-                    this.title = title
-                    this.thumbnail_url = if (img != null) "$baseUrl/$img" else null
-                }
-            } else {
-                null
+            val link = item.selectFirst("a") ?: item.parent()?.takeIf { it.tagName() == "a" }
+            val url = link?.attr("href") ?: ""
+            val img = item.selectFirst("div.img, img")?.let {
+                it.attr("style").substringAfter("url('").substringBefore("')").ifEmpty { it.attr("src") }
             }
+            val title = item.selectFirst("div.title, h3, span.title")?.text() ?: item.attr("alt")
+
+            if (url.isNotEmpty() && !title.isNullOrEmpty()) {
+                SAnime.create().apply {
+                    this.url = url
+                    this.title = title
+                    this.thumbnail_url = if (!img.isNullOrEmpty()) {
+                        if (img.startsWith("http")) img else "$baseUrl/$img"
+                    } else null
+                }
+            } else null
         }
-        return AnimesPage(animeList, false)
+        return AnimesPage(animeList, hasNext && animeList.isNotEmpty())
     }
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        return anime.apply {
-            initialized = true
-        }
-    }
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = anime.apply { initialized = true }
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        return listOf(
-            SEpisode.create().apply {
-                name = "Movie"
-                url = anime.url
-                date_upload = 0L
-                episode_number = 1F
-            }
-        )
+        return listOf(SEpisode.create().apply {
+            name = "Play Movie/TV"
+            url = anime.url
+            episode_number = 1F
+        })
     }
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val document = client.newCall(GET("$baseUrl/${episode.url}")).execute().asJsoup()
-        
-        // Strategy: Look for video tag or source
-        val videoUrl = document.select("video source").attr("src")
-            .ifEmpty { document.select("video").attr("src") }
-        
+        val url = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
+        val document = client.newCall(GET(url)).execute().asJsoup()
+        val videoUrl = document.select("video source").attr("src").ifEmpty { document.select("video").attr("src") }
         if (videoUrl.isNotEmpty()) {
-            return listOf(Video(videoUrl, "Quality", videoUrl))
+            val absoluteVideoUrl = if (videoUrl.startsWith("http")) videoUrl else "$baseUrl/$videoUrl"
+            return listOf(Video(absoluteVideoUrl, "Direct", absoluteVideoUrl))
         }
-        
-        throw IOException("Video URL not found")
+        throw IOException("Video not found")
+    }
+
+    override fun getFilterList() = AnimeFilterList(CategoryFilter())
+
+    private class CategoryFilter : AnimeFilter.Select<String>("Category", arrayOf(
+        "All", "3D", "4K", "Animated", "Anime", "Bangla (BD)", "Bangla (Kolkata)", "Chinese Movies", 
+        "Documentaries", "Dual Audio", "English Movies", "Exclusive Full-HD", "Hindi Movies", 
+        "Indonesian Movies", "Japanese Movies", "Korean Movies", "South Indian Movies", "WWE",
+        "Bangla Drama", "Serials (Anime)", "Serials (English)", "Serials (Hindi)"
+    )) {
+        private val ids = arrayOf(
+            "", "9", "74", "33", "83", "59", "60", "76", 
+            "41", "43", "19", "44", "2", 
+            "79", "80", "75", "73", "52",
+            "34", "78", "36", "37"
+        )
+        fun toValue() = ids[state]
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {}
