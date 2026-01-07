@@ -12,8 +12,8 @@ android {
         applicationId = "eu.kanade.tachiyomi.animeextension.all.iccftp"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1002
-        versionName = "14.1002"
+        versionCode = 1003
+        versionName = "14.1003"
 
         manifestPlaceholders = [
             appName: "ICC FTP",
