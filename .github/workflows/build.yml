@@ -1,0 +1,84 @@
+name: Build ICC FTP
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auto Bump Version
+        run: |
+          .github/scripts/bump_gradle_version.sh
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add app/build.gradle
+          git commit -m "Auto-bump version [skip ci]" || echo "No changes to commit"
+          git push origin main || echo "No changes to push"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Build with Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.5
+          arguments: :app:assembleRelease
+
+      - name: Get Metadata
+        run: |
+          VERSION_NAME=$(grep "versionName =" app/build.gradle | head -n 1 | awk -F'"' '{print $2}')
+          VERSION_CODE=$(grep "versionCode =" app/build.gradle | head -n 1 | awk '{print $3}')
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
+
+      - name: Rename APK
+        run: |
+          mv app/build/outputs/apk/release/*.apk app/build/outputs/apk/release/eu.kanade.tachiyomi.animeextension.all.iccftp-v${{ env.VERSION_NAME }}-c${{ env.VERSION_CODE }}.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: Release v${{ env.VERSION_NAME }}
+          files: |
+            app/build/outputs/apk/release/eu.kanade.tachiyomi.animeextension.all.iccftp-v${{ env.VERSION_NAME }}-c${{ env.VERSION_CODE }}.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Extension Repo
+        run: |
+          # This requires a secret named 'GH_PAT' with repo scope
+          if [ -n "${{ secrets.GH_PAT }}" ]; then
+            git clone https://${{ secrets.GH_PAT }}@github.com/salmanbappi/extensions-repo.git repo_tmp
+            cp app/build/outputs/apk/release/*.apk repo_tmp/apk/
+            cd repo_tmp
+            git add apk/*.apk
+            git config user.name "GitHub Action"
+            git config user.email "action@github.com"
+            git commit -m "Update ICC FTP to v${{ env.VERSION_NAME }}"
+            git push
+          else
+            echo "Secret 'PAT' not found. Skipping extension repo update."
+            echo "Please add a secret named 'PAT' with 'repo' scope to enable automatic repo updates."
+          fi

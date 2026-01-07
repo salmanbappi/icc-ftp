@@ -1,0 +1,62 @@
+plugins {
+    id("com.android.application")
+    id("kotlin-android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+}
+
+android {
+    namespace = "eu.kanade.tachiyomi.animeextension.all.iccftp"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "eu.kanade.tachiyomi.animeextension.all.iccftp"
+        minSdk = 21
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+
+        manifestPlaceholders = [
+            appName: "ICC FTP",
+            extClass: ".IccFtp",
+            nsfw: "0"
+        ]
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/kotlin']
+        }
+    }
+
+    signingConfigs {
+        release {
+            storeFile file("../keystore.jks")
+            storePassword "ftpbd123"
+            keyAlias "dflix"
+            keyPassword "ftpbd123"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+}
+
+dependencies {
+    implementation project(":core")
+    implementation("org.apache.commons:commons-text:1.10.0")
+    compileOnly libs.bundles.provided
+    implementation libs.bundles.common
+}
