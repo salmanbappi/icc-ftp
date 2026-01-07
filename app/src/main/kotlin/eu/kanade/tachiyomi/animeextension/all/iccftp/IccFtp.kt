@@ -69,17 +69,59 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         .followSslRedirects(true)
         .build()
 
+    // Popular = Top Slider
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         if (page > 1) return AnimesPage(emptyList(), false)
-        val response = client.newCall(GET("$baseUrl/index.php?category=0")).execute()
-        return parseAnimeList(response.asJsoup())
+        val response = client.newCall(GET("$baseUrl/dashboard.php")).execute()
+        val document = response.asJsoup()
+        val items = document.select("div.slider.multipost div.item")
+        val animeList = items.mapNotNull { item ->
+            val link = item.parent() // <a> wraps div.item
+            val url = link.attr("href")
+            val img = item.selectFirst("div.img")?.attr("style")
+                ?.substringAfter("url('")?.substringBefore("')")
+            val title = item.selectFirst("div.title span")?.text()
+
+            if (url.isNotEmpty() && !title.isNullOrEmpty()) {
+                SAnime.create().apply {
+                    this.url = url
+                    this.title = title
+                    this.thumbnail_url = if (img != null) "$baseUrl/$img" else null
+                }
+            } else null
+        }
+        return AnimesPage(animeList, false)
     }
 
-    override suspend fun getLatestUpdates(page: Int): AnimesPage = getPopularAnime(page)
+    // Latest = Grid with Infinite Scroll
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val request = if (page == 1) {
+            GET("$baseUrl/dashboard.php")
+        } else {
+            val body = FormBody.Builder().add("cpage", page.toString()).build()
+            POST("$baseUrl/command.php", body = body)
+        }
+        val response = client.newCall(request).execute()
+        val document = response.asJsoup()
+        val items = document.select("div.post")
+        val animeList = items.mapNotNull { item ->
+            val link = item.selectFirst("a.image")
+            val url = link?.attr("href") ?: ""
+            val img = link?.selectFirst("img")
+            val title = item.selectFirst("div.title")?.text()
+
+            if (url.isNotEmpty() && !title.isNullOrEmpty()) {
+                SAnime.create().apply {
+                    this.url = url
+                    this.title = title
+                    this.thumbnail_url = img?.attr("src")?.let { if (it.startsWith("http")) it else "$baseUrl/$it" }
+                }
+            } else null
+        }
+        return AnimesPage(animeList, animeList.isNotEmpty())
+    }
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (page > 1) return AnimesPage(emptyList(), false)
-        
         if (query.isNotBlank()) {
             val mediaType = "application/x-www-form-urlencoded".toMediaType()
             val body = "cSearch=$query".toRequestBody(mediaType)
@@ -98,30 +140,27 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         var category = "0"
         filters.forEach { if (it is CategoryFilter) category = it.toValue() }
         
-        val url = "$baseUrl/index.php?category=$category"
+        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
         val response = client.newCall(GET(url)).execute()
-        return parseAnimeList(response.asJsoup())
-    }
-
-    private fun parseAnimeList(document: Document): AnimesPage {
-        val items = document.select("div.post-wrapper > a") 
+        val document = response.asJsoup()
+        
+        // For categories, the structure is usually div.post
+        val items = document.select("div.post")
         val animeList = items.mapNotNull { item ->
-            val url = item.attr("href")
-            val img = item.selectFirst("img")
-            val title = img?.attr("alt") ?: item.selectFirst("div.title")?.text()
+            val link = item.selectFirst("a.image")
+            val url = link?.attr("href") ?: ""
+            val img = link?.selectFirst("img")
+            val title = item.selectFirst("div.title")?.text()
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
                     this.url = url
                     this.title = title
-                    val imgSrc = img?.attr("src")
-                    this.thumbnail_url = if (imgSrc != null) {
-                        if (imgSrc.startsWith("http")) imgSrc else "$baseUrl/$imgSrc"
-                    } else null
+                    this.thumbnail_url = img?.attr("src")?.let { if (it.startsWith("http")) it else "$baseUrl/$it" }
                 }
             } else null
         }
-        return AnimesPage(animeList, false)
+        return AnimesPage(animeList, animeList.isNotEmpty())
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -167,8 +206,6 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         if (episode.url.isBlank()) throw IOException("Video URL is empty")
-        
-        // The URL is already the direct stream link
         val videoUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
         return listOf(Video(videoUrl, "Direct", videoUrl))
     }
