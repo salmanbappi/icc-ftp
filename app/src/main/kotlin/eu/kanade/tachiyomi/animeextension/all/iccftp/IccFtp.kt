@@ -163,10 +163,11 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         filters.forEach { filter ->
             when (filter) {
                 is CategoryFilter -> if(filter.toValue() != "0") category = filter.toValue()
-                is TVShowFilter -> if(filter.toValue() != "0") category = filter.toValue()
-                is OtherFilter -> if(filter.toValue() != "0") category = filter.toValue()
-            }
-        }
+                                is TVShowFilter -> if (filter.toValue() != "0") category = filter.toValue()
+                                is OtherFilter -> if (filter.toValue() != "0") category = filter.toValue()
+                                else -> {}
+                            }
+                        }
         
         val url = "$baseUrl/dashboard.php?category=$category"
         val response = client.newCall(GET(url)).execute()
