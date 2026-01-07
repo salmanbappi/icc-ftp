@@ -40,7 +40,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     override val supportsLatest = true
     override val id: Long = 84726193058274619L
 
-    private val json = Json { ignoreUnknownKeys = true }
+    override val json = Json { ignoreUnknownKeys = true }
     private var sessionId: String by preferences.delegate("session_id", "")
 
     private val sessionInterceptor = Interceptor { chain ->
