@@ -132,10 +132,10 @@ class IccFtp : Source(), ConfigurableAnimeSource {
             }
         }
         
-        // Use index.php for stable category filtering
-        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
+        // Use dashboard.php for filtering as it was reported working previously
+        val url = "$baseUrl/dashboard.php?category=$category"
         val response = client.newCall(GET(url)).execute()
-        return parseAnimeList(response.asJsoup(), true)
+        return parseAnimeList(response.asJsoup(), false) // Disable pageno for filters to prevent repetition
     }
 
     private fun parseAnimeList(document: Document, hasNext: Boolean): AnimesPage {
