@@ -45,19 +45,28 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     private val sessionInterceptor = Interceptor { chain ->
         val originalRequest = chain.request()
-        val response = chain.proceed(originalRequest)
-        
-        val urlSession = response.request.url.queryParameter("session")
-        if (urlSession != null && urlSession.length > 10) {
-            sessionId = urlSession
+        val originalUrl = originalRequest.url
+
+        if (originalUrl.encodedPath == "/" && originalUrl.querySize == 0) {
+            return@Interceptor chain.proceed(originalRequest)
         }
 
-        if (response.code == 302 || response.request.url.encodedPath.contains("vfw.php")) {
+        val newUrl = if (originalUrl.queryParameter("session") == null && !originalUrl.encodedPath.contains("command.php")) {
+            if (sessionId.isBlank()) fetchSessionId()
+            originalUrl.newBuilder().addQueryParameter("session", sessionId).build()
+        } else {
+            originalUrl
+        }
+
+        val request = originalRequest.newBuilder().url(newUrl).build()
+        val response = chain.proceed(request)
+
+        if (response.request.url.encodedPath.contains("vfw.php") || (response.code == 302 && response.header("Location")?.contains("vfw.php") == true)) {
             response.close()
-            val newResp = chain.proceed(GET(baseUrl))
-            val newSession = newResp.request.url.queryParameter("session")
-            if (newSession != null) sessionId = newSession
-            return@Interceptor newResp
+            sessionId = "" 
+            fetchSessionId()
+            val retryUrl = originalUrl.newBuilder().setQueryParameter("session", sessionId).build()
+            return@Interceptor chain.proceed(originalRequest.newBuilder().url(retryUrl).build())
         }
 
         response
@@ -69,10 +78,22 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         .followSslRedirects(true)
         .build()
 
-    // Popular = Top Slider items
+    @Synchronized
+    private fun fetchSessionId() {
+        if (sessionId.isNotBlank()) return
+        try {
+            val response = network.client.newCall(GET(baseUrl)).execute()
+            val finalUrl = response.request.url
+            response.close()
+            val session = finalUrl.queryParameter("session")
+            if (session != null) sessionId = session
+        } catch (e: Exception) {}
+    }
+
+    // Popular = Top Slider items (Page 1 only)
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         if (page > 1) return AnimesPage(emptyList(), false)
-        val response = client.newCall(GET("$baseUrl/dashboard.php?category=0")).execute()
+        val response = client.newCall(GET("$baseUrl/index.php?category=0")).execute()
         val doc = response.asJsoup()
         val items = doc.select("div#post-slider-multipost div.item")
         val animeList = items.mapNotNull { item ->
@@ -84,7 +105,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
-                    this.url = url
+                    this.url = if (url.contains("session=")) url else "$url&session=$sessionId"
                     this.title = title
                     this.thumbnail_url = if (imgSrc.isNotEmpty()) "$baseUrl/$imgSrc" else null
                 }
@@ -96,7 +117,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     // Latest = Grid items with working infinite scroll
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         val request = if (page == 1) {
-            GET("$baseUrl/dashboard.php?category=0")
+            GET("$baseUrl/index.php?category=0")
         } else {
             val body = FormBody.Builder().add("cpage", page.toString()).build()
             POST("$baseUrl/command.php", body = body)
@@ -114,7 +135,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
             val searchJson = try { response.parseAs<List<SearchJsonItem>>(json) } catch(e: Exception) { emptyList() }
             val animeList = searchJson.map { item ->
                 SAnime.create().apply {
-                    this.url = "player.php?play=${item.id}"
+                    this.url = "player.php?play=${item.id}&session=$sessionId"
                     this.title = item.name ?: ""
                     this.thumbnail_url = "$baseUrl/files/${item.image}"
                 }
@@ -132,14 +153,13 @@ class IccFtp : Source(), ConfigurableAnimeSource {
             }
         }
         
-        // Use dashboard.php for filtering as it was reported working previously
-        val url = "$baseUrl/dashboard.php?category=$category"
+        // Use index.php for categories
+        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
         val response = client.newCall(GET(url)).execute()
-        return parseAnimeList(response.asJsoup(), false) // Disable pageno for filters to prevent repetition
+        return parseAnimeList(response.asJsoup(), true)
     }
 
     private fun parseAnimeList(document: Document, hasNext: Boolean): AnimesPage {
-        // Use broad selectors to catch items in AJAX fragments and full pages
         val items = document.select("div.post, div.post-wrapper > a, div.item > a, div.post-item > a") 
         val animeList = items.mapNotNull { item ->
             val url = if (item.tagName() == "a") item.attr("href") else item.selectFirst("a")?.attr("href") ?: ""
@@ -148,7 +168,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
-                    this.url = url
+                    this.url = if (url.contains("session=")) url else "$url&session=$sessionId"
                     this.title = title
                     val imgSrc = img?.attr("src") ?: img?.attr("style")?.substringAfter("url('")?.substringBefore("')")
                     this.thumbnail_url = if (imgSrc != null) {
