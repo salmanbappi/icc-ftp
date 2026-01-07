@@ -45,19 +45,28 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     private val sessionInterceptor = Interceptor { chain ->
         val originalRequest = chain.request()
-        val response = chain.proceed(originalRequest)
-        
-        val urlSession = response.request.url.queryParameter("session")
-        if (urlSession != null && urlSession.length > 10) {
-            sessionId = urlSession
+        val originalUrl = originalRequest.url
+
+        if (originalUrl.encodedPath == "/" && originalUrl.querySize == 0) {
+            return@Interceptor chain.proceed(originalRequest)
         }
 
-        if (response.code == 302 || response.request.url.encodedPath.contains("vfw.php")) {
+        val newUrl = if (originalUrl.queryParameter("session") == null && !originalUrl.encodedPath.contains("command.php")) {
+            if (sessionId.isBlank()) fetchSessionId()
+            originalUrl.newBuilder().addQueryParameter("session", sessionId).build()
+        } else {
+            originalUrl
+        }
+
+        val request = originalRequest.newBuilder().url(newUrl).build()
+        val response = chain.proceed(request)
+
+        if (response.request.url.encodedPath.contains("vfw.php") || (response.code == 302 && response.header("Location")?.contains("vfw.php") == true)) {
             response.close()
-            val newResp = chain.proceed(GET(baseUrl))
-            val newSession = newResp.request.url.queryParameter("session")
-            if (newSession != null) sessionId = newSession
-            return@Interceptor newResp
+            sessionId = "" 
+            fetchSessionId()
+            val retryUrl = originalUrl.newBuilder().setQueryParameter("session", sessionId).build()
+            return@Interceptor chain.proceed(originalRequest.newBuilder().url(retryUrl).build())
         }
 
         response
@@ -69,45 +78,57 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         .followSslRedirects(true)
         .build()
 
-    // Popular = Top Slider
+    @Synchronized
+    private fun fetchSessionId() {
+        if (sessionId.isNotBlank()) return
+        try {
+            val response = network.client.newCall(GET(baseUrl)).execute()
+            val finalUrl = response.request.url
+            response.close()
+            val session = finalUrl.queryParameter("session")
+            if (session != null) sessionId = session
+        } catch (e: Exception) {}
+    }
+
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         if (page > 1) return AnimesPage(emptyList(), false)
-        val response = client.newCall(GET("$baseUrl/dashboard.php")).execute()
-        val document = response.asJsoup()
-        val items = document.select("div.slider.multipost div.item")
+        val response = client.newCall(GET("$baseUrl/dashboard.php?category=0")).execute()
+        val doc = response.asJsoup()
+        // Target specifically the slider
+        val items = doc.select("div#post-slider-multipost div.item")
         val animeList = items.mapNotNull { item ->
-            val link = item.parent() // <a> wraps div.item
+            val link = item.parent() ?: return@mapNotNull null
             val url = link.attr("href")
-            val img = item.selectFirst("div.img")?.attr("style")
-                ?.substringAfter("url('")?.substringBefore("')")
+            val imgStyle = item.selectFirst("div.img")?.attr("style") ?: ""
+            val imgSrc = imgStyle.substringAfter("url('").substringBefore("')")
             val title = item.selectFirst("div.title span")?.text()
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
                     this.url = url
                     this.title = title
-                    this.thumbnail_url = if (img != null) "$baseUrl/$img" else null
+                    this.thumbnail_url = if (imgSrc.isNotEmpty()) "$baseUrl/$imgSrc" else null
                 }
             } else null
         }
         return AnimesPage(animeList, false)
     }
 
-    // Latest = Grid with Infinite Scroll
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         val request = if (page == 1) {
-            GET("$baseUrl/dashboard.php")
+            GET("$baseUrl/dashboard.php?category=0")
         } else {
             val body = FormBody.Builder().add("cpage", page.toString()).build()
             POST("$baseUrl/command.php", body = body)
         }
         val response = client.newCall(request).execute()
-        val document = response.asJsoup()
-        val items = document.select("div.post")
+        val doc = response.asJsoup()
+        // Target specifically the news stories grid
+        val items = doc.select("div#news-stories div.post")
         val animeList = items.mapNotNull { item ->
-            val link = item.selectFirst("a.image")
-            val url = link?.attr("href") ?: ""
-            val img = link?.selectFirst("img")
+            val link = item.selectFirst("a.image") ?: return@mapNotNull null
+            val url = link.attr("href")
+            val img = link.selectFirst("img")
             val title = item.selectFirst("div.title")?.text()
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
@@ -123,6 +144,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         if (query.isNotBlank()) {
+            if (page > 1) return AnimesPage(emptyList(), false)
             val mediaType = "application/x-www-form-urlencoded".toMediaType()
             val body = "cSearch=$query".toRequestBody(mediaType)
             val response = client.newCall(POST("$baseUrl/command.php", body = body)).execute()
@@ -138,18 +160,24 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         }
 
         var category = "0"
-        filters.forEach { if (it is CategoryFilter) category = it.toValue() }
+        filters.forEach { filter ->
+            when (filter) {
+                is CategoryFilter -> if(filter.toValue() != "0") category = filter.toValue()
+                is TVShowFilter -> if(filter.toValue() != "0") category = filter.toValue()
+                is OtherFilter -> if(filter.toValue() != "0") category = filter.toValue()
+            }
+        }
         
-        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
+        val url = "$baseUrl/dashboard.php?category=$category"
         val response = client.newCall(GET(url)).execute()
-        val document = response.asJsoup()
+        val doc = response.asJsoup()
         
-        // For categories, the structure is usually div.post
-        val items = document.select("div.post")
+        // For filtered results, use the generic post selector
+        val items = doc.select("div.post")
         val animeList = items.mapNotNull { item ->
-            val link = item.selectFirst("a.image")
-            val url = link?.attr("href") ?: ""
-            val img = link?.selectFirst("img")
+            val link = item.selectFirst("a.image") ?: return@mapNotNull null
+            val url = link.attr("href")
+            val img = link.selectFirst("img")
             val title = item.selectFirst("div.title")?.text()
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
@@ -160,7 +188,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
                 }
             } else null
         }
-        return AnimesPage(animeList, animeList.isNotEmpty())
+        return AnimesPage(animeList, false)
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -206,18 +234,53 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         if (episode.url.isBlank()) throw IOException("Video URL is empty")
-        val videoUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
-        return listOf(Video(videoUrl, "Direct", videoUrl))
+        if (episode.url.endsWith(".mp4") || episode.url.endsWith(".mkv") || episode.url.contains("ftps")) {
+            val videoUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
+            return listOf(Video(videoUrl, "Direct", videoUrl))
+        }
+        val url = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
+        val finalUrl = if (url.contains("session=")) url else "$url&session=$sessionId"
+        val document = client.newCall(GET(finalUrl)).execute().asJsoup()
+        val videoUrl = document.select("video source").attr("src")
+            .ifEmpty { document.select("video").attr("src") }
+            .ifEmpty { document.select("a.btn:contains(DOWNLOAD)").attr("href") }
+            .ifEmpty { document.select("a.btn").attr("href") }
+        if (videoUrl.isNotEmpty()) {
+            val absoluteVideoUrl = if (videoUrl.startsWith("http")) videoUrl else "$baseUrl/$videoUrl"
+            return listOf(Video(absoluteVideoUrl, "Direct", absoluteVideoUrl))
+        }
+        throw IOException("Video not found")
     }
 
-    override fun getFilterList() = AnimeFilterList(CategoryFilter())
+    override fun getFilterList() = AnimeFilterList(
+        AnimeFilter.Header("Use only one filter at a time"),
+        CategoryFilter(),
+        TVShowFilter(),
+        OtherFilter()
+    )
 
-    private class CategoryFilter : AnimeFilter.Select<String>("Category", arrayOf(
-        "Latest", "Bangla Movies", "Hindi Movies", "English Movies", "Dual Audio", "South Movies", "Animated", "English Series", "Hindi Series", "Documentary"
-    )) {
-        private val ids = arrayOf("0", "59", "2", "19", "43", "32", "33", "36", "37", "41")
-        fun toValue() = ids[state]
+    private open class SelectFilter(name: String, val items: Array<Pair<String, String>>) : AnimeFilter.Select<String>(name, items.map { it.first }.toTypedArray()) {
+        fun toValue() = items[state].second
     }
+
+    private class CategoryFilter : SelectFilter("Movies", arrayOf(
+        "None" to "0", "3D" to "9", "4K" to "74", "Animated" to "33", "Anime" to "83", "Bangla (BD)" to "59", 
+        "Bangla (Kolkata)" to "60", "Chinese" to "76", "Documentaries" to "41", "Dual Audio" to "43", 
+        "English" to "19", "Exclusive Full-HD" to "44", "Hindi" to "2", "Indonesian" to "79", 
+        "Japanese" to "80", "Korean" to "75", "Other Foreign" to "64", "Pakistani" to "77", 
+        "Punjabi" to "71", "South Indian (Hindi Dub)" to "32", "South Indian" to "73"
+    ))
+
+    private class TVShowFilter : SelectFilter("TV Shows", arrayOf(
+        "None" to "0", "Awards" to "38", "Bangla Drama" to "34", "Bangla Telefilm" to "35", 
+        "Serials (Animation)" to "82", "Serials (Anime)" to "78", "Serials (Bangla)" to "39", 
+        "Serials (Documentaries)" to "81", "Serials (Dual Audio)" to "72", "Serials (English)" to "36", 
+        "Serials (Hindi)" to "37", "Serials (Others)" to "70", "WWE" to "52"
+    ))
+
+    private class OtherFilter : SelectFilter("Others", arrayOf(
+        "None" to "0", "Kids (Cartoon)" to "66", "Learning" to "53"
+    ))
 
     @Serializable data class SearchJsonItem(val id: String? = null, val image: String? = null, val name: String? = null)
 
