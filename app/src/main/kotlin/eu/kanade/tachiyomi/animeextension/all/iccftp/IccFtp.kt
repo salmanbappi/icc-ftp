@@ -82,7 +82,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     private fun fetchSessionId() {
         if (sessionId.isNotBlank()) return
         try {
-            val response = client.newCall(GET(baseUrl)).execute()
+            val response = network.client.newCall(GET(baseUrl)).execute()
             val finalUrl = response.request.url
             response.close()
             val session = finalUrl.queryParameter("session")
@@ -91,16 +91,19 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
-        val url = if (page == 1) "$baseUrl/index.php?category=0" else "$baseUrl/index.php?category=0&pageno=$page"
-        val response = client.newCall(GET(url)).execute()
-        return parseAnimeList(response.asJsoup(), true)
+        if (page > 1) return AnimesPage(emptyList(), false)
+        val response = client.newCall(GET("$baseUrl/dashboard.php?category=0")).execute()
+        return parseAnimeList(response.asJsoup(), false)
     }
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage = getPopularAnime(page)
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        if (page > 1) return AnimesPage(emptyList(), false)
+        
         if (query.isNotBlank()) {
-            val body = "cSearch=$query".toRequestBody("application/x-www-form-urlencoded".toMediaType())
+            val mediaType = "application/x-www-form-urlencoded".toMediaType()
+            val body = "cSearch=$query".toRequestBody(mediaType)
             val response = client.newCall(POST("$baseUrl/command.php", body = body)).execute()
             val searchJson = response.parseAs<List<SearchJsonItem>>(json)
             val animeList = searchJson.map { item ->
@@ -116,27 +119,28 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         var category = "0"
         filters.forEach { if (it is CategoryFilter) category = it.toValue() }
         
-        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
+        val url = "$baseUrl/dashboard.php?category=$category"
         val response = client.newCall(GET(url)).execute()
-        return parseAnimeList(response.asJsoup(), true)
+        return parseAnimeList(response.asJsoup(), false)
     }
 
     private fun parseAnimeList(document: Document, hasNext: Boolean): AnimesPage {
-        val items = document.select("div.post-wrapper > a") 
+        val items = document.select("div.post-wrapper > a, div.item > a, div.post-item > a") 
         val animeList = items.mapNotNull { item ->
             val url = item.attr("href")
-            val img = item.selectFirst("img")
-            val title = img?.attr("alt") ?: item.selectFirst("div.title")?.text()
+            val img = item.selectFirst("img") ?: item.selectFirst("div.img")
+            val title = img?.attr("alt") ?: item.selectFirst("div.title")?.text() ?: item.attr("title")
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
-                    this.url = url
+                    this.url = if (url.contains("session=")) url else "$url&session=$sessionId"
                     this.title = title
-                    this.thumbnail_url = img?.attr("src")?.let { if (it.startsWith("http")) it else "$baseUrl/$it" }
+                    val imgSrc = img?.attr("src") ?: img?.attr("style")?.substringAfter("url('")?.substringBefore("')")
+                    this.thumbnail_url = if (imgSrc?.startsWith("http") == true) imgSrc else "$baseUrl/$imgSrc"
                 }
             } else null
         }
-        return AnimesPage(animeList, hasNext && animeList.isNotEmpty())
+        return AnimesPage(animeList, hasNext)
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -156,7 +160,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
         
         if (downloadEpisode.isEmpty()) {
             return listOf(SEpisode.create().apply {
-                name = "Movie"
+                name = "Play Movie/TV"
                 url = anime.url
                 episode_number = 1F
             })
@@ -168,17 +172,18 @@ class IccFtp : Source(), ConfigurableAnimeSource {
             val span = it.select("span").text()
             SEpisode.create().apply {
                 this.name = nameText.replace(span, "").trim()
-                this.url = link
+                this.url = if (link.contains("session=")) link else "$link&session=$sessionId"
                 this.episode_number = (index + 1).toFloat()
             }
         }.reversed()
     }
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val doc = client.newCall(GET("$baseUrl/${episode.url}")).execute().asJsoup()
-        val videoUrl = doc.select("video source").attr("src")
-            .ifEmpty { doc.select("video").attr("src") }
-            .ifEmpty { doc.select("a.btn").attr("href") }
+        val url = if (episode.url.startsWith("http")) episode.url else "$baseUrl/${episode.url}"
+        val document = client.newCall(GET(url)).execute().asJsoup()
+        val videoUrl = document.select("video source").attr("src")
+            .ifEmpty { document.select("video").attr("src") }
+            .ifEmpty { document.select("a.btn").attr("href") }
         
         if (videoUrl.isNotEmpty()) {
             val absoluteVideoUrl = if (videoUrl.startsWith("http")) videoUrl else "$baseUrl/$videoUrl"
