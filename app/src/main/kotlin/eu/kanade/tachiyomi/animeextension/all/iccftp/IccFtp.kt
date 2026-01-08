@@ -93,7 +93,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     // Popular = Top Slider items (Page 1 only)
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         if (page > 1) return AnimesPage(emptyList(), false)
-        val response = client.newCall(GET("$baseUrl/index.php?category=0")).execute()
+        val response = client.newCall(GET("$baseUrl/dashboard.php?category=0")).execute()
         val doc = response.asJsoup()
         val items = doc.select("div#post-slider-multipost div.item")
         val animeList = items.mapNotNull { item ->
@@ -105,7 +105,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
             if (url.isNotEmpty() && !title.isNullOrEmpty()) {
                 SAnime.create().apply {
-                    this.url = if (url.contains("session=")) url else "$url&session=$sessionId"
+                    this.url = if (url.contains("session=")) url else if(url.contains("?")) "$url&session=$sessionId" else "$url?session=$sessionId"
                     this.title = title
                     this.thumbnail_url = if (imgSrc.isNotEmpty()) "$baseUrl/$imgSrc" else null
                 }
@@ -117,9 +117,12 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     // Latest = Grid items with working infinite scroll
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         val request = if (page == 1) {
-            GET("$baseUrl/index.php?category=0")
+            GET("$baseUrl/dashboard.php?category=0")
         } else {
-            val body = FormBody.Builder().add("cpage", page.toString()).build()
+            val body = FormBody.Builder()
+                .add("cpage", page.toString())
+                .add("category", "0")
+                .build()
             POST("$baseUrl/command.php", body = body)
         }
         val response = client.newCall(request).execute()
@@ -153,35 +156,55 @@ class IccFtp : Source(), ConfigurableAnimeSource {
             }
         }
         
-        // Use index.php for categories
-        val url = if (page == 1) "$baseUrl/index.php?category=$category" else "$baseUrl/index.php?category=$category&pageno=$page"
-        val response = client.newCall(GET(url)).execute()
+        // Use dashboard.php for categories
+        val request = if (page == 1) {
+            GET("$baseUrl/dashboard.php?category=$category")
+        } else {
+            val body = FormBody.Builder()
+                .add("cpage", page.toString())
+                .add("category", category)
+                .build()
+            POST("$baseUrl/command.php", body = body)
+        }
+        val response = client.newCall(request).execute()
         return parseAnimeList(response.asJsoup(), true)
     }
 
     private fun parseAnimeList(document: Document, hasNext: Boolean): AnimesPage {
-        val items = document.select("div.post, div.post-wrapper > a, div.item > a, div.post-item > a") 
-        val animeList = items.mapNotNull { item ->
+        val items = document.select("div.post, div.post-item, div.post-wrapper > a, div.item > a") 
+        val animeList = mutableListOf<SAnime>()
+        val seenUrls = mutableSetOf<String>()
+
+        items.forEach { item ->
             val url = if (item.tagName() == "a") item.attr("href") else item.selectFirst("a")?.attr("href") ?: ""
+            if (url.isBlank()) return@forEach
+            
+            val normalizedUrl = url.substringBefore("&session=").substringBefore("?session=")
+            if (seenUrls.contains(normalizedUrl)) return@forEach
+            
+            // Skip slider items if present in the document
+            if (item.parents().any { it.id() == "post-slider-multipost" }) return@forEach
+
             val img = item.selectFirst("img") ?: item.selectFirst("div.img")
             val title = img?.attr("alt") ?: item.selectFirst("div.title")?.text() ?: item.attr("title") ?: item.selectFirst("span")?.text()
 
-            if (url.isNotEmpty() && !title.isNullOrEmpty()) {
-                SAnime.create().apply {
-                    this.url = if (url.contains("session=")) url else "$url&session=$sessionId"
+            if (!title.isNullOrEmpty()) {
+                animeList.add(SAnime.create().apply {
+                    this.url = if (url.contains("session=")) url else if(url.contains("?")) "$url&session=$sessionId" else "$url?session=$sessionId"
                     this.title = title
                     val imgSrc = img?.attr("src") ?: img?.attr("style")?.substringAfter("url('")?.substringBefore("')")
                     this.thumbnail_url = if (imgSrc != null) {
                         if (imgSrc.startsWith("http")) imgSrc else "$baseUrl/$imgSrc"
                     } else null
-                }
-            } else null
+                })
+                seenUrls.add(normalizedUrl)
+            }
         }
         return AnimesPage(animeList, hasNext && animeList.isNotEmpty())
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val url = if (anime.url.contains("session=")) anime.url else "${anime.url}&session=$sessionId"
+        val url = if (anime.url.contains("session=")) anime.url else if(anime.url.contains("?")) "${anime.url}&session=$sessionId" else "${anime.url}?session=$sessionId"
         val doc = client.newCall(GET("$baseUrl/$url")).execute().asJsoup()
         val table = doc.select(".table > tbody:nth-child(1)")
         return anime.apply {
@@ -193,7 +216,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     }
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val url = if (anime.url.contains("session=")) anime.url else "${anime.url}&session=$sessionId"
+        val url = if (anime.url.contains("session=")) anime.url else if(anime.url.contains("?")) "${anime.url}&session=$sessionId" else "${anime.url}?session=$sessionId"
         val doc = client.newCall(GET("$baseUrl/$url")).execute().asJsoup()
         val downloadEpisode = doc.select(".btn-group > ul > li")
         
@@ -254,7 +277,7 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     ))
 
     private class OtherFilter : SelectFilter("Others", arrayOf(
-        "None" to "0", "Kids (Cartoon)" to "66", "Learning" to "53"
+        "None" to "0", "E-Books" to "68", "Kids (Cartoon)" to "66", "Learning" to "53"
     ))
 
     @Serializable data class SearchJsonItem(val id: String? = null, val image: String? = null, val name: String? = null)
