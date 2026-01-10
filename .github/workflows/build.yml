@@ -66,19 +66,38 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update Extension Repo
-        run: |
-          # This requires a secret named 'GH_PAT' with repo scope
-          if [ -n "${{ secrets.GH_PAT }}" ]; then
-            git clone https://${{ secrets.GH_PAT }}@github.com/salmanbappi/extensions-repo.git repo_tmp
-            cp app/build/outputs/apk/release/*.apk repo_tmp/apk/
-            cd repo_tmp
-            git add apk/*.apk
-            git config user.name "GitHub Action"
-            git config user.email "action@github.com"
-            git commit -m "Update ICC FTP to v${{ env.VERSION_NAME }}"
-            git push
-          else
-            echo "Secret 'PAT' not found. Skipping extension repo update."
-            echo "Please add a secret named 'PAT' with 'repo' scope to enable automatic repo updates."
-          fi
+            - name: Update Extension Repo
+
+              run: |
+
+                # This requires a secret named 'GH_PAT' with repo scope
+
+                if [ -n "${{ secrets.GH_PAT }}" ]; then
+
+                  git clone https://${{ secrets.GH_PAT }}@github.com/salmanbappi/extensions-repo.git repo_tmp
+
+                  cp app/build/outputs/apk/release/*.apk repo_tmp/apk/
+
+                  cd repo_tmp
+
+                  python3 generate_repo.py
+
+                  git add apk/*.apk index.min.json repo.json
+
+                  git config user.name "GitHub Action"
+
+                  git config user.email "action@github.com"
+
+                  git commit -m "Update ICC FTP to v${{ env.VERSION_NAME }}"
+
+                  git push
+
+                else
+
+                  echo "Secret 'PAT' not found. Skipping extension repo update."
+
+                  echo "Please add a secret named 'PAT' with 'repo' scope to enable automatic repo updates."
+
+                fi
+
+      
