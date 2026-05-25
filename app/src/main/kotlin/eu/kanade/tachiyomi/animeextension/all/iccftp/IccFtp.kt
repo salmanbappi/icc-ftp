@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.iccftp
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -14,15 +15,19 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
 import extensions.utils.Source
+import extensions.utils.addEditTextPreference
 import extensions.utils.delegate
 import extensions.utils.get
 import extensions.utils.parseAs
+import okhttp3.Cookie
 import okhttp3.FormBody
+import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -31,11 +36,18 @@ import kotlinx.serialization.json.Json
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 class IccFtp : Source(), ConfigurableAnimeSource {
 
     override val name = "ICC FTP"
-    override val baseUrl = "http://10.16.100.244"
+    override val baseUrl: String
+        get() = preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT) ?: PREF_DOMAIN_DEFAULT
     override val lang = "all"
     override val supportsLatest = true
     override val id: Long = 84726193058274619L
@@ -43,36 +55,68 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     override val json = Json { ignoreUnknownKeys = true }
     private var sessionId: String by preferences.delegate("session_id", "")
 
+    private val unsafeTrustManager = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+
+    private val unsafeSslSocketFactory = SSLContext.getInstance("TLS").apply {
+        init(null, arrayOf<TrustManager>(unsafeTrustManager), SecureRandom())
+    }.socketFactory
+
+    private val unsafeBaseClient: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .sslSocketFactory(unsafeSslSocketFactory, unsafeTrustManager)
+        .hostnameVerifier { _, _ -> true }
+        .build()
+
+    private val cm by lazy { CookieManager(unsafeBaseClient) }
+
     private val sessionInterceptor = Interceptor { chain ->
         val originalRequest = chain.request()
         val originalUrl = originalRequest.url
+        val urlString = originalUrl.toString()
+
+        val request = originalRequest.newBuilder()
+            .apply {
+                val cookie = cm.getCookiesHeaders(urlString)
+                removeHeader("User-Agent")
+                addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                if (cookie.isNotBlank()) {
+                    removeHeader("Cookie")
+                    addHeader("Cookie", cookie)
+                }
+            }
+            .build()
 
         if (originalUrl.encodedPath == "/" && originalUrl.querySize == 0) {
-            return@Interceptor chain.proceed(originalRequest)
+            return@Interceptor chain.proceed(request)
         }
 
         val newUrl = if (originalUrl.queryParameter("session") == null && !originalUrl.encodedPath.contains("command.php")) {
             if (sessionId.isBlank()) fetchSessionId()
-            originalUrl.newBuilder().addQueryParameter("session", sessionId).build()
+            request.url.newBuilder().addQueryParameter("session", sessionId).build()
         } else {
-            originalUrl
+            request.url
         }
 
-        val request = originalRequest.newBuilder().url(newUrl).build()
-        val response = chain.proceed(request)
+        val finalRequest = request.newBuilder().url(newUrl).build()
+        val response = chain.proceed(finalRequest)
 
         if (response.request.url.encodedPath.contains("vfw.php") || (response.code == 302 && response.header("Location")?.contains("vfw.php") == true)) {
             response.close()
             sessionId = "" 
             fetchSessionId()
             val retryUrl = originalUrl.newBuilder().setQueryParameter("session", sessionId).build()
-            return@Interceptor chain.proceed(originalRequest.newBuilder().url(retryUrl).build())
+            return@Interceptor chain.proceed(request.newBuilder().url(retryUrl).build())
         }
 
         response
     }
 
-    override val client: OkHttpClient = network.client.newBuilder()
+    override val client: OkHttpClient = unsafeBaseClient.newBuilder()
         .addInterceptor(sessionInterceptor)
         .followRedirects(true)
         .followSslRedirects(true)
@@ -82,12 +126,45 @@ class IccFtp : Source(), ConfigurableAnimeSource {
     private fun fetchSessionId() {
         if (sessionId.isNotBlank()) return
         try {
-            val response = network.client.newCall(GET(baseUrl)).execute()
+            val response = unsafeBaseClient.newCall(GET(baseUrl)).execute()
             val finalUrl = response.request.url
             response.close()
             val session = finalUrl.queryParameter("session")
             if (session != null) sessionId = session
         } catch (e: Exception) {}
+    }
+
+    private class CookieManager(private val client: OkHttpClient) {
+        private var cookies = mutableMapOf<String, List<Cookie>>()
+        private val lock = Any()
+
+        fun getCookiesHeaders(url: String): String {
+            val host = try { url.toHttpUrl().host } catch (e: Exception) { return "" }
+            val currentCookies = synchronized(lock) {
+                cookies[host] ?: fetchCookies(url).also { cookies[host] = it }
+            }
+            return currentCookies.joinToString("; ") { "${it.name}=${it.value}" }
+        }
+
+        private fun fetchCookies(url: String): List<Cookie> {
+            val hostUrl = try { 
+                val u = url.toHttpUrl()
+                "${u.scheme}://${u.host}/".toHttpUrl()
+            } catch (e: Exception) { return emptyList() }
+            
+            val req = Request.Builder()
+                .url(hostUrl)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+            return try {
+                val res = client.newBuilder().followRedirects(false).build().newCall(req).execute()
+                val cookieList = Cookie.parseAll(hostUrl, res.headers)
+                res.close()
+                cookieList
+            } catch (e: IOException) {
+                emptyList()
+            }
+        }
     }
 
     // Popular = Top Slider items (Page 1 only)
@@ -282,5 +359,20 @@ class IccFtp : Source(), ConfigurableAnimeSource {
 
     @Serializable data class SearchJsonItem(val id: String? = null, val image: String? = null, val name: String? = null)
 
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addEditTextPreference(
+            key = PREF_DOMAIN_KEY,
+            default = PREF_DOMAIN_DEFAULT,
+            title = "Base URL",
+            summary = "The base URL for the ICC FTP server",
+            getSummary = { it },
+            validate = { it.startsWith("http://") || it.startsWith("https://") },
+            validationMessage = { "The URL must start with http:// or https://" }
+        )
+    }
+
+    companion object {
+        private const val PREF_DOMAIN_KEY = "pref_domain"
+        private const val PREF_DOMAIN_DEFAULT = "http://10.16.100.244"
+    }
 }
